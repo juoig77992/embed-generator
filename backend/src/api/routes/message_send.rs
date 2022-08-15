@@ -4,20 +4,20 @@ use actix_web::post;
 use actix_web::web::{Json, ReqData};
 use data_url::DataUrl;
 use lazy_static::lazy_static;
-use twilight_model::application::component::Component;
 use twilight_model::channel::ChannelType;
 use twilight_model::guild::{Member, Permissions};
 use twilight_model::http::attachment::Attachment;
+use twilight_model::id::Id;
 
 use crate::api::response::{MessageSendError, RouteError, RouteResult};
 use crate::api::wire::{MessageSendRequestWire, MessageSendResponseWire, MessageSendTargetWire};
-use crate::bot::message::{MessageAction, MessagePayload};
+use crate::bot::message::MessagePayload;
 use crate::bot::message::{MessageHashIntegrity, MessageVariablesReplace, ToMessageVariables};
 use crate::bot::permissions::get_member_permissions_for_channel;
 use crate::bot::webhooks::{get_webhooks_for_channel, CachedWebhook};
 use crate::bot::{DISCORD_CACHE, DISCORD_HTTP};
 use crate::config::CONFIG;
-use crate::db::models::{ChannelMessageModel, GuildsWithAccessModel, MessageModel};
+use crate::db::models::{ChannelMessageAuthorModel, ChannelMessageModel, GuildsWithAccessModel};
 use crate::tokens::TokenClaims;
 use crate::util::unix_now_mongodb;
 
@@ -26,32 +26,6 @@ const ICON_BYTES: &[u8] = include_bytes!("../../../../frontend/public/logo128.pn
 lazy_static! {
     static ref ICON_DATA_URL: String =
         format!("data:image/png;base64,{}", base64::encode(ICON_BYTES));
-}
-
-fn parse_component_actions(components: &[Component]) -> Vec<MessageAction> {
-    let mut result = vec![];
-
-    for component in components {
-        match component {
-            Component::ActionRow(a) => {
-                result.extend(parse_component_actions(&a.components).into_iter())
-            }
-            Component::Button(b) => {
-                if let Some(custom_id) = &b.custom_id {
-                    result.extend(MessageAction::parse(custom_id).into_iter())
-                }
-            }
-            Component::SelectMenu(s) => {
-                result.extend(MessageAction::parse(&s.custom_id).into_iter());
-                for option in &s.options {
-                    result.extend(MessageAction::parse(&option.value).into_iter())
-                }
-            }
-            _ => {}
-        }
-    }
-
-    result
 }
 
 #[post("/messages/send")]
@@ -91,7 +65,7 @@ pub async fn route_message_send(
     let mut variables = HashMap::new();
     let mut payload: MessagePayload = serde_json::from_str(&req.payload_json).unwrap();
 
-    let (webhook_id, webhook_token, channel_id, thread_id, message_id) = match req.target {
+    let (webhook_id, webhook_token, thread_id, message_id, model) = match req.target {
         MessageSendTargetWire::Webhook {
             webhook_id,
             webhook_token,
@@ -99,7 +73,7 @@ pub async fn route_message_send(
             message_id,
         } => {
             payload.components = vec![]; // Manual webhooks don't support components
-            (webhook_id, webhook_token, None, thread_id, message_id)
+            (webhook_id, webhook_token, thread_id, message_id, None)
         }
         MessageSendTargetWire::Channel {
             guild_id,
@@ -138,35 +112,39 @@ pub async fn route_message_send(
                 return Err(RouteError::BotMissingChannelAccess);
             }
 
-            let (perms, highest_role) = {
-                let member: Member = DISCORD_HTTP
-                    .guild_member(guild_id, token.user_id)
-                    .exec()
-                    .await?
-                    .model()
-                    .await
-                    .unwrap();
+            let member: Member = DISCORD_HTTP
+                .guild_member(guild_id, token.user_id)
+                .exec()
+                .await?
+                .model()
+                .await
+                .unwrap();
 
-                let perms = get_member_permissions_for_channel(
-                    token.user_id,
-                    &member.roles,
-                    guild_id,
-                    channel_id,
-                )
-                .unwrap_or(Permissions::empty());
-
-                let highest_role = if guild.owner_id() == token.user_id {
-                    9999
-                } else {
-                    member.roles.iter().filter_map(|r| DISCORD_CACHE.role(*r).map(|r| r.position)).max().unwrap_or(0)
-                };
-
-                (perms, highest_role)
-            };
+            let perms = get_member_permissions_for_channel(
+                token.user_id,
+                &member.roles,
+                guild_id,
+                channel_id,
+            )
+            .unwrap_or(Permissions::empty());
 
             if !perms.contains(Permissions::MANAGE_WEBHOOKS) {
                 return Err(RouteError::MissingChannelAccess);
             }
+
+            let model = ChannelMessageModel {
+                channel_id,
+                message_id: Id::new(1),
+                hash: payload.integrity_hash(),
+                created_at: unix_now_mongodb(),
+                updated_at: unix_now_mongodb(),
+                author: Some(ChannelMessageAuthorModel {
+                    id: token.user_id,
+                    is_owner: guild.owner_id() == token.user_id,
+                    permissions: perms,
+                    role_ids: member.roles.clone(),
+                }),
+            };
 
             let (channel_id, thread_id) = match channel.kind {
                 ChannelType::GuildPrivateThread
@@ -175,56 +153,6 @@ pub async fn route_message_send(
                 ChannelType::GuildText | ChannelType::GuildNews => (channel.id, None),
                 _ => return Err(RouteError::UnsupportedChannelType),
             };
-
-            let actions = parse_component_actions(&payload.components);
-            for action in actions {
-                match action {
-                    MessageAction::Unknown => {
-                        return Err(RouteError::NotFound {
-                            entity: "action".into(),
-                        })
-                    }
-                    MessageAction::ResponseSavedMessage { message_id, .. } => {
-                        if !MessageModel::exists_by_owner_id_and_id(token.user_id, &message_id)
-                            .await?
-                        {
-                            return Err(RouteError::InvalidMessageAction {
-                                details:
-                                    "Response message doesn't exist or is owned by someone else"
-                                        .into(),
-                            });
-                        }
-                    }
-                    MessageAction::RoleToggle { role_id, .. } => {
-                        if !perms.contains(Permissions::MANAGE_ROLES) {
-                            return Err(RouteError::InvalidMessageAction {
-                                details: "Missing permission to manage roles".into(),
-                            });
-                        }
-
-                        match DISCORD_CACHE.role(role_id) {
-                            Some(role) => {
-                                if role.guild_id() != guild_id {
-                                    return Err(RouteError::InvalidMessageAction {
-                                        details: "Role to toggle is not in this guild".into(),
-                                    });
-                                }
-                                if role.position > highest_role {
-                                    return Err(RouteError::InvalidMessageAction {
-                                        details: "You don't have permissions to toggle that role"
-                                            .into(),
-                                    });
-                                }
-                            }
-                            None => {
-                                return Err(RouteError::InvalidMessageAction {
-                                    details: "Unknown role to toggle".into(),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
 
             channel.to_message_variables(&mut variables);
             guild.to_message_variables(&mut variables);
@@ -239,9 +167,9 @@ pub async fn route_message_send(
                 (
                     webhook.id,
                     webhook.token.unwrap(),
-                    Some(channel_id),
                     thread_id,
                     message_id,
+                    Some(model),
                 )
             } else if existing_webhook_count >= 10 {
                 return Err(RouteError::ChannelWebhookLimitReached);
@@ -259,9 +187,9 @@ pub async fn route_message_send(
                 (
                     webhook.id,
                     webhook.token.unwrap(),
-                    Some(channel_id),
                     thread_id,
                     message_id,
+                    Some(model),
                 )
             }
         }
@@ -308,16 +236,9 @@ pub async fn route_message_send(
 
     match res {
         Ok(message_id) => {
-            if let Some(channel_id) = channel_id {
-                ChannelMessageModel {
-                    channel_id,
-                    message_id,
-                    hash: payload.integrity_hash(),
-                    updated_at: unix_now_mongodb(),
-                    created_at: unix_now_mongodb(),
-                }
-                .update_or_create()
-                .await?;
+            if let Some(mut model) = model {
+                model.message_id = message_id;
+                model.update_or_create().await?;
             }
 
             Ok(Json(MessageSendResponseWire { message_id }.into()))

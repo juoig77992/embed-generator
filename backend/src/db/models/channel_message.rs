@@ -1,13 +1,22 @@
 use futures_util::StreamExt;
-use mongodb::bson::{doc, DateTime};
+use mongodb::bson::{DateTime, doc};
 use mongodb::error::Error as MongoError;
 use mongodb::options::UpdateOptions;
 use mongodb::results::{DeleteResult, UpdateResult};
 use serde::{Deserialize, Serialize};
-use twilight_model::id::marker::{ChannelMarker, MessageMarker};
+use twilight_model::guild::Permissions;
 use twilight_model::id::Id;
+use twilight_model::id::marker::{ChannelMarker, MessageMarker, RoleMarker, UserMarker};
 
 use crate::db::get_collection;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChannelMessageAuthorModel {
+    pub id: Id<UserMarker>,
+    pub is_owner: bool,
+    pub permissions: Permissions,
+    pub role_ids: Vec<Id<RoleMarker>>,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChannelMessageModel {
@@ -16,6 +25,9 @@ pub struct ChannelMessageModel {
     pub hash: String,
     pub created_at: DateTime,
     pub updated_at: DateTime,
+
+    #[serde(default)]
+    pub author: Option<ChannelMessageAuthorModel>,
 }
 
 impl ChannelMessageModel {
@@ -39,7 +51,7 @@ impl ChannelMessageModel {
             .await
     }
 
-    pub async fn exists_by_message_id_and_hash(
+    pub async fn _exists_by_message_id_and_hash(
         message_id: Id<MessageMarker>,
         hash: &str,
     ) -> Result<bool, MongoError> {
@@ -50,6 +62,14 @@ impl ChannelMessageModel {
             )
             .await
             .map(|count| count > 0)
+    }
+
+    pub async fn find_by_message_id(
+        message_id: Id<MessageMarker>,
+    ) -> Result<Option<Self>, MongoError> {
+        get_collection::<Self>("channel_messages")
+            .find_one(doc! {"message_id": message_id.to_string()}, None)
+            .await
     }
 
     pub async fn find_by_channel_id(

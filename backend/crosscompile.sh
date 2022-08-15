@@ -1,1 +1,1 @@
-TARGET_CC=x86_64-unknown-linux-gnu-gcc cargo build --release --target x86_64-unknown-linux-gnu
+TARGET_CC=x86_64-unknown-linux-gnu-gcc cargo build --release --no-default-features --target x86_64-unknown-linux-gnu

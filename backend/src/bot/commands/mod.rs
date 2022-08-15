@@ -5,22 +5,27 @@ use twilight_http::client::InteractionClient;
 use twilight_http::response::DeserializeBodyError;
 use twilight_model::application::command::Command;
 use twilight_model::application::component::ComponentType;
-use twilight_model::application::interaction::{Interaction, InteractionData, InteractionType};
 use twilight_model::application::interaction::message_component::MessageComponentInteractionData;
+use twilight_model::application::interaction::{Interaction, InteractionData, InteractionType};
 use twilight_model::channel::message::MessageFlags;
 use twilight_model::http::interaction::{
     InteractionResponse, InteractionResponseData, InteractionResponseType,
 };
-use twilight_model::id::Id;
 use twilight_model::id::marker::InteractionMarker;
+use twilight_model::id::Id;
 
-use crate::bot::DISCORD_HTTP;
-use crate::bot::message::{MessageAction, MessagePayload};
+use actions::ActionPermissionsContext;
+
+use crate::bot::commands::actions::handle_component_actions;
+use crate::bot::message::MessageAction;
+use crate::bot::message::MessageVariablesReplace;
 use crate::bot::message::{MessageHashIntegrity, ToMessageVariables};
-use crate::bot::message::{MessageVariablesReplace, ResponseSavedMessageFlags};
-use crate::CONFIG;
-use crate::db::models::{ChannelMessageModel, MessageModel};
+use crate::bot::DISCORD_HTTP;
+use crate::db::models::ChannelMessageModel;
 use crate::db::RedisPoolError;
+use crate::CONFIG;
+
+pub mod actions;
 
 mod embed;
 mod format;
@@ -109,24 +114,48 @@ async fn handle_unknown_component(
     let message = interaction.message.as_ref().unwrap();
     let message_timestamp = message.edited_timestamp.unwrap_or(message.timestamp);
 
-    // message integrity wasn't part of the initial release so we can't expect older messages to have it
-    if message_timestamp.as_secs() > 1659880800
-        && message.author.id != CONFIG.discord.oauth_client_id.cast()
-        && !ChannelMessageModel::exists_by_message_id_and_hash(
-            message.id,
-            &message.integrity_hash(),
-        )
-        .await?
-    {
-        simple_response(
-            &http,
-            interaction.id,
-            &interaction.token,
-            "Message integrity could not be validated".into(),
-        )
-        .await?;
-        return Ok(());
-    }
+    let model = ChannelMessageModel::find_by_message_id(message.id).await?;
+    let perm_ctx = match model {
+        Some(m) => {
+            if m.hash == message.integrity_hash() {
+                simple_response(
+                    &http,
+                    interaction.id,
+                    &interaction.token,
+                    "Message integrity could not be validated".into(),
+                )
+                .await?;
+                return Ok(());
+            }
+            // permissions checks worked different before this timestamp, so we can skip that
+            if message_timestamp.as_secs() < 0 {
+                ActionPermissionsContext::Allow
+            } else {
+                match m.author {
+                    Some(a) => ActionPermissionsContext::from(&a),
+                    None => ActionPermissionsContext::Deny,
+                }
+            }
+        }
+        None => {
+            if message.author.id != CONFIG.discord.oauth_client_id.cast() {
+                simple_response(
+                    &http,
+                    interaction.id,
+                    &interaction.token,
+                    "Message integrity could not be validated".into(),
+                )
+                .await?;
+                return Ok(());
+            }
+            // message integrity wasn't part of the initial release so we can't expect older messages to have it
+            if message_timestamp.as_secs() < 1659880800 {
+                ActionPermissionsContext::Allow
+            } else {
+                ActionPermissionsContext::Deny
+            }
+        }
+    };
 
     let response = match comp.component_type {
         ComponentType::Button => comp.custom_id.as_str(),
@@ -145,7 +174,7 @@ async fn handle_unknown_component(
         response.replace_variables(&variables);
         simple_response(&http, interaction.id, &interaction.token, response).await?;
     } else {
-        handle_component_actions(&http, &interaction, actions).await?;
+        handle_component_actions(&http, &interaction, actions, perm_ctx).await?;
     }
 
     if comp.component_type == ComponentType::SelectMenu {
@@ -157,136 +186,6 @@ async fn handle_unknown_component(
             .unwrap()
             .exec()
             .await;
-    }
-
-    Ok(())
-}
-
-async fn handle_component_actions(
-    http: &InteractionClient<'_>,
-    interaction: &Interaction,
-    actions: Vec<MessageAction>,
-) -> InteractionResult {
-    for action in actions {
-        match action {
-            MessageAction::Unknown => {}
-            MessageAction::ResponseSavedMessage { message_id, flags } => {
-                match MessageModel::find_by_id(&message_id).await? {
-                    Some(model) => {
-                        match serde_json::from_str::<MessagePayload>(&model.payload_json) {
-                            Ok(mut payload) => {
-                                let mut variables = HashMap::new();
-                                interaction.to_message_variables(&mut variables);
-                                payload.replace_variables(&variables);
-
-                                let response_kind = if flags.contains(ResponseSavedMessageFlags::EDIT) {
-                                    InteractionResponseType::UpdateMessage
-                                } else {
-                                    InteractionResponseType::ChannelMessageWithSource
-                                };
-
-                                http.create_response(
-                                    interaction.id,
-                                    &interaction.token,
-                                    &InteractionResponse {
-                                        kind: response_kind,
-                                        data: Some(InteractionResponseData {
-                                            content: payload.content,
-                                            components: Some(payload.components),
-                                            embeds: Some(
-                                                payload
-                                                    .embeds
-                                                    .into_iter()
-                                                    .map(|e| e.into())
-                                                    .collect(),
-                                            ),
-                                            flags: Some(MessageFlags::EPHEMERAL),
-                                            ..Default::default()
-                                        }),
-                                    },
-                                )
-                                .exec()
-                                .await?;
-                            }
-                            Err(_) => {
-                                simple_response(
-                                    http,
-                                    interaction.id,
-                                    &interaction.token,
-                                    "Invalid response message".into(),
-                                )
-                                .await?;
-                            }
-                        };
-                    }
-                    None => {
-                        simple_response(
-                            http,
-                            interaction.id,
-                            &interaction.token,
-                            "Response message not found".into(),
-                        )
-                        .await?;
-                    }
-                }
-            }
-            MessageAction::RoleToggle { role_id } => {
-                let member = interaction.member.as_ref().unwrap();
-                let user_id = member.user.as_ref().unwrap().id;
-                let guild_id = interaction.guild_id.unwrap();
-                if member.roles.contains(&role_id) {
-                    match DISCORD_HTTP
-                        .remove_guild_member_role(guild_id, user_id, role_id)
-                        .exec()
-                        .await
-                    {
-                        Ok(_) => {
-                            simple_response(
-                                http,
-                                interaction.id,
-                                &interaction.token,
-                                format!("You no longer have the <@&{}> role", role_id),
-                            )
-                            .await?;
-                        }
-                        Err(_) => {
-                            simple_response(
-                                http,
-                                interaction.id,
-                                &interaction.token,
-                                "Failed to remove role. Does the bot have permissions to remove this role?".into(),
-                            )
-                            .await?;
-                        }
-                    }
-                } else {
-                    match DISCORD_HTTP
-                        .add_guild_member_role(guild_id, user_id, role_id)
-                        .exec()
-                        .await
-                    {
-                        Ok(_) => {
-                            simple_response(
-                                http,
-                                interaction.id,
-                                &interaction.token,
-                                format!("You now have the <@&{}> role", role_id),
-                            )
-                            .await?;
-                        }
-                        Err(_) => {
-                            simple_response(
-                                http,
-                                interaction.id,
-                                &interaction.token,
-                                "Failed to add role. Does the bot have permissions to remove this role?".into(),
-                            )
-                            .await?;
-                        }
-                    }
-                }
-            }
-        }
     }
 
     Ok(())

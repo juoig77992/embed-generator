@@ -17,7 +17,7 @@ pub fn get_member_permissions_for_channel(
         .unwrap_or(Permissions::empty());
 
     let roles: Vec<(Id<RoleMarker>, Permissions)> = roles_ids
-        .into_iter()
+        .iter()
         .filter_map(|role_id| {
             DISCORD_CACHE
                 .role(*role_id)
